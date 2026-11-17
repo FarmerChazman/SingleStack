@@ -7,10 +7,10 @@ COMPOSE := docker compose --env-file .env
 EDGE_NETWORK ?= edge
 
 .PHONY: help init network preflight up down restart ps logs doctor backup restore upgrade \
-        psql chatwoot-console lint
+        psql chatwoot-console lint test email-routing-plan email-routing-apply email-routing-status
 
 help: ## List targets
-	@awk 'BEGIN{FS=":.*## "} /^[a-z-]+:.*## /{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN{FS=":.*## "} /^[a-z-]+:.*## /{printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 # ── setup ──────────────────────────────────────────────────────────────────
 init: ## Create .env with fresh secrets: make init DOMAIN=example.com
@@ -23,6 +23,16 @@ network: ## Create the edge network (make up does this too)
 
 preflight: ## Read-only checks: config, ports, network, resources, egress
 	@scripts/preflight.sh
+
+# ── cloudflare email routing (all domains) ───────────────────────────────
+email-routing-plan: ## Show Email Routing changes for every domain in deploy/cloudflare/email-routing.conf
+	@scripts/cf-email-routing.sh plan
+
+email-routing-apply: ## Apply them (enable zones, subaddressing, rules, catch-alls)
+	@scripts/cf-email-routing.sh apply
+
+email-routing-status: ## Settings, SPF, rules and expected DNS per domain
+	@scripts/cf-email-routing.sh status
 
 # ── lifecycle ──────────────────────────────────────────────────────────────
 up: ## Start / reconcile the stack and wait until healthy
@@ -64,8 +74,12 @@ chatwoot-console: ## Rails console in the Chatwoot web container
 
 # ── quality ────────────────────────────────────────────────────────────────
 lint: ## shellcheck + compose render + worker typecheck (same as CI)
-	shellcheck -x scripts/*.sh scripts/lib/*.sh services/postgres/initdb/*.sh
+	shellcheck -x scripts/*.sh scripts/lib/*.sh services/postgres/initdb/*.sh tests/*/*.sh
 	@tmp=$$(mktemp -u); ENV_FILE=$$tmp scripts/init-env.sh ci.example.org >/dev/null; \
 	  sed -i 's/^CHATWOOT_SMTP_USER=$$/CHATWOOT_SMTP_USER=ci/; s/^CHATWOOT_SMTP_KEY=$$/CHATWOOT_SMTP_KEY=ci/' $$tmp; \
 	  docker compose --env-file $$tmp config -q && echo "compose: ok"; rm -f $$tmp
 	cd workers/inbound-mail && npm run --silent typecheck
+
+test: ## Worker unit tests + Email Routing script against a mock Cloudflare API
+	cd workers/inbound-mail && npm test --silent
+	tests/cf-email-routing/run.sh

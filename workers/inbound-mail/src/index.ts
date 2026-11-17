@@ -1,8 +1,9 @@
 // Cloudflare Email Worker: Email Routing -> Chatwoot (Action Mailbox relay ingress).
 //
-// Route in Cloudflare Email Routing:
-//   support@<domain>          -> this worker   (one rule per support address / brand)
-//   *@<CHATWOOT_INBOUND_DOMAIN> -> this worker (catch-all; reply+<uuid>@ continuity)
+// Route in Cloudflare Email Routing (docs/03-cloudflare-email-routing.md):
+//   support@<domain>                  -> this worker (one rule per support address / brand)
+//   reply@<CHATWOOT_INBOUND_DOMAIN>   -> this worker, with subaddressing enabled so
+//                                        reply+<uuid>@ (conversation replies) matches it
 //
 // If Chatwoot can't be reached, the message is forwarded to FALLBACK_FORWARD
 // (a verified destination) so nothing is lost. Without a fallback the handler

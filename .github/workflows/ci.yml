@@ -10,7 +10,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck -x scripts/*.sh scripts/lib/*.sh services/postgres/initdb/*.sh
+        run: shellcheck -x scripts/*.sh scripts/lib/*.sh services/postgres/initdb/*.sh tests/*/*.sh
       - name: compose renders with a generated .env
         run: |
           ENV_FILE=/tmp/ci.env scripts/init-env.sh ci.example.org
@@ -20,6 +20,8 @@ jobs:
         run: |
           sed '/^REDIS_PASSWORD=/d' /tmp/ci.env > /tmp/broken.env
           ! docker compose --env-file /tmp/broken.env config -q 2>/dev/null
+      - name: cf-email-routing.sh against mock Cloudflare API
+        run: tests/cf-email-routing/run.sh
 
   inbound-mail-worker:
     runs-on: ubuntu-latest

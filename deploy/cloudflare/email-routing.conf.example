@@ -1,0 +1,33 @@
+# Cloudflare Email Routing — desired state for every domain you own.
+# Read by scripts/cf-email-routing.sh (plan / apply / status).
+# Full explanation: docs/03-cloudflare-email-routing.md
+#
+#   cp deploy/cloudflare/email-routing.conf.example deploy/cloudflare/email-routing.conf
+#
+# One rule per line, whitespace-separated:
+#
+#   <zone>          <address>                 <action>  [<target>]
+#
+#   zone     the Cloudflare zone (apex domain) the rule lives in
+#   address  full address (local@domain), or * for the zone's catch-all
+#   action   worker   -> target is the Worker name (e.g. singlestack-inbound-mail)
+#            forward  -> target is a destination mailbox (verified once per account)
+#            drop     -> no target; silently discard
+#
+# The script only creates and updates the rules listed here. It never deletes
+# rules it doesn't know about; it lists them as "unmanaged" so you can decide.
+# Lines starting with # and blank lines are ignored.
+
+# ── brand 1 ───────────────────────────────────────────────────────────────
+example.com      support@example.com      worker   singlestack-inbound-mail
+example.com      reply@example.com        worker   singlestack-inbound-mail
+example.com      hello@example.com        forward  you@your-mailbox.example
+example.com      dmarc@example.com        forward  you@your-mailbox.example
+example.com      *                        drop
+
+# ── brand 2 (same Worker, same Chatwoot; add a matching inbox in Chatwoot) ─
+example.org      support@example.org      worker   singlestack-inbound-mail
+example.org      *                        forward  you@your-mailbox.example
+
+# ── a domain that only forwards (no support desk) ─────────────────────────
+example.net      *                        forward  you@your-mailbox.example

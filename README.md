@@ -1,89 +1,112 @@
 # singlestack
 
-A support desk and newsletter stack for one shared Docker host. It doesn't run
-a mail server, publish any ports, or run its own TLS.
+A self-hosted **support desk and newsletter stack** for people who run
+several domains from one shared Docker host. It doesn't run a mail server,
+publish any ports, or manage its own TLS.
 
 | Job | Handled by |
 |---|---|
-| Support desk (email, website chat) | **Chatwoot** (`support.<domain>`) |
-| Newsletters and campaigns | **Listmonk** (`lists.<domain>`) |
-| Receiving mail | **Cloudflare Email Routing** → `workers/inbound-mail` → Chatwoot |
+| Support desk (email + website live chat) | **[Chatwoot](https://www.chatwoot.com)** at `support.<domain>` |
+| Newsletters and campaigns | **[Listmonk](https://listmonk.app)** at `lists.<domain>` |
+| Receiving mail, for every domain | **Cloudflare Email Routing** → `workers/inbound-mail` → Chatwoot |
 | Sending mail (Chatwoot, Listmonk, your apps) | **Brevo** SMTP relay, one key per sender |
-| TLS and public ingress | Existing Cloudflare Tunnel (`vmwebt1650`) → `localhost:3001` / `:3002` |
+| HTTPS and public access | **Cloudflare Tunnel** → `localhost:3001` / `:3002` |
 
 ```
-                 Cloudflare (TLS, DNS, Email Routing)
-     HTTPS │                                  │ SMTP in (MX)
-           ▼                                  ▼
-  ┌─ cloudflared ────┐            ┌─ Email Worker: inbound-mail ─┐
-  │ tunnel on host   │◄── HTTPS ──│ POST message/rfc822 + basic  │
-  └──────┬───────────┘            │ auth → Chatwoot relay ingress│
-         │ localhost:3001 / 3002  └──────────────────────────────┘
-  ┌──────┴───────────────── singlestack ──────────────────────────┐
-  │ ss-chatwoot :3000  ss-chatwoot-worker   ss-listmonk :9000     │
-  │        └──────────────┬───────────────────────┘               │
-  │            docker net "backend" (internal, no egress)         │
-  │              ss-postgres (2 DBs)      ss-redis                │
-  └───────────────────────────────────────────────────────────────┘
-         │ SMTP 587 out
-         ▼
-       Brevo ──► recipients
+                    Cloudflare  (DNS · TLS · Email Routing · Tunnel)
+        HTTPS │                                      │ SMTP in (MX)
+              ▼                                      ▼
+   ┌─ cloudflared ─────┐                ┌─ Email Worker: inbound-mail ─┐
+   │ tunnel (on host)  │◄──── HTTPS ────│ raw message + X-Original-To  │
+   └───────┬───────────┘                │ → Chatwoot relay ingress     │
+           │ 127.0.0.1:3001 / :3002     │ retries · fallback forward   │
+   ┌───────┴────────────── singlestack ─┴──────────────────────────────┐
+   │ ss-chatwoot   ss-chatwoot-worker   ss-listmonk                    │
+   │        └───────────────┬─────────────────┘                        │
+   │          network "backend" (internal, no internet)                │
+   │            ss-postgres (one DB per app)     ss-redis              │
+   └───────────────────────────────────────────────────────────────────┘
+           │ SMTP 587 (STARTTLS)
+           ▼
+         Brevo ──► recipients
 ```
 
-## Quick start
+## Documentation
+
+Start at **[docs/README.md](docs/README.md)**. It's a ten-chapter guide from
+concepts to operations:
+
+1. [Concepts](docs/01-concepts.md): MX, SPF, DKIM, DMARC, envelopes, and how mail flows here
+2. [Prerequisites and planning](docs/02-prerequisites.md)
+3. [Cloudflare Email Routing for all your domains](docs/03-cloudflare-email-routing.md), by hand or scripted
+4. [Brevo for outbound mail](docs/04-brevo.md)
+5. [The inbound-mail Worker](docs/05-inbound-worker.md)
+6. [Server installation](docs/06-server-install.md)
+7. [Publishing the web UIs](docs/07-publishing.md)
+8. [First run: Chatwoot and Listmonk](docs/08-first-run.md)
+9. [Operations](docs/09-operations.md): backups, upgrades, monitoring, troubleshooting
+10. [Sending from your own apps](docs/10-app-smtp.md)
+
+Plus [architecture and decisions](docs/architecture.md).
+
+## Quick start (for readers who know the pieces)
 
 ```bash
 git clone https://github.com/FarmerChazman/SingleStack.git /opt/singlestack && cd /opt/singlestack
-make init DOMAIN=farmanalyser.com # .env with generated secrets (mode 600)
-$EDITOR .env                      # Brevo SMTP user + key for Chatwoot
-make preflight                    # read-only checks; fix any ✗
-make up                           # starts, runs migrations, waits for healthy
-make doctor                       # end-to-end health
+make init DOMAIN=example.com          # .env with generated secrets (mode 600)
+$EDITOR .env                          # Brevo SMTP login + key for Chatwoot
+make preflight && make up && make doctor
+
+# every domain's inbound mail, from one file:
+cp deploy/cloudflare/email-routing.conf.example deploy/cloudflare/email-routing.conf
+$EDITOR deploy/cloudflare/email-routing.conf
+export CLOUDFLARE_API_TOKEN=… CLOUDFLARE_ACCOUNT_ID=…
+make email-routing-plan && make email-routing-apply
 ```
 
-Then, in this order:
+Then deploy the Worker (ch. 5), add two tunnel routes (ch. 7), and complete
+the first run (ch. 8).
 
-1. **Publish.** In tunnel `vmwebt1650`, add two published-application routes:
-   `support.` → `http://localhost:3001` and `lists.` → `http://localhost:3002`.
-   See [docs/reverse-proxy.md](docs/reverse-proxy.md).
-2. **Mail DNS and the worker.** Verify the domain in Brevo, deploy the worker,
-   and add the Email Routing rules. See [docs/email-and-dns.md](docs/email-and-dns.md).
-3. **First login.** Set up Chatwoot and Listmonk. See
-   [docs/operations.md#first-run](docs/operations.md#first-run).
-4. **Your apps.** Give each app its own Brevo SMTP key. See [docs/app-smtp.md](docs/app-smtp.md).
-
-## Layout
+## Repository layout
 
 ```
-compose.yaml                   the whole stack (5 long-running services + 1 migrate job)
-.env.example                   every setting, documented; secrets generated by make init
-Makefile                       entry point (`make help`)
-scripts/                       preflight, up, doctor, backup, restore (+ lib/common.sh)
-services/postgres/initdb/      first-boot: one role + DB per app, extensions
-workers/inbound-mail/          Cloudflare Email Worker (TypeScript, unit-tested)
-deploy/nginx/                  optional: vhosts if you front the stack with an nginx container
-deploy/cloudflared/            optional: ingress rules for a containerised cloudflared
-docs/                          architecture + decisions, DNS, proxy, operations, app SMTP
-.github/workflows/ci.yml       shellcheck, compose render, worker typecheck + tests
+compose.yaml                     the stack: postgres, redis, chatwoot (migrate/web/worker), listmonk
+.env.example                     every setting, documented; secrets generated by `make init`
+Makefile                         entry point — `make help`
+scripts/
+  init-env.sh preflight.sh up.sh doctor.sh backup.sh restore.sh
+  cf-email-routing.sh            Email Routing for many domains (plan/apply/status)
+  lib/common.sh                  shared helpers
+services/postgres/initdb/        first boot: one role + database per app, extensions
+workers/inbound-mail/            Cloudflare Email Worker (TypeScript, unit-tested)
+deploy/cloudflare/               email-routing.conf.example
+deploy/nginx/, deploy/cloudflared/   optional: proxy-container setups
+tests/cf-email-routing/          the routing script against a mock Cloudflare API
+docs/                            the guide
+.github/workflows/ci.yml         shellcheck, compose render, Worker + script tests
 ```
 
-## Commands
+## Make targets
 
-| | |
+| Target | |
 |---|---|
-| `make up` / `make down` | start, reconcile, or stop (volumes are kept) |
-| `make logs s=chatwoot-web` | follow logs for one service |
-| `make doctor` | containers, `/health`, inbound ingress auth, public URLs, DB size |
-| `make backup` | DB dumps, file volumes and `.env` to `backups/<UTC stamp>/` |
-| `make restore FROM=backups/…` | destructive restore with checksum verification |
-| `make upgrade` | backup, pull pinned images, migrate, wait for healthy, doctor |
-| `make lint` | same checks as CI |
+| `init DOMAIN=…` | create `.env` with fresh secrets |
+| `preflight` | read-only checks: config, ports, resources, egress |
+| `up` / `down` / `restart` / `ps` / `logs s=…` | lifecycle |
+| `doctor` | containers, `/health`, ingress auth, public URLs, DB sizes |
+| `backup` / `restore FROM=…` / `upgrade` | data safety |
+| `email-routing-plan` / `-apply` / `-status` | Cloudflare Email Routing for all configured domains |
+| `lint` / `test` | what CI runs |
 
-## Host requirements
+## Requirements
 
-- Docker Engine and the Compose v2 plugin.
-- About 3–4 GiB free RAM and 10 GiB free disk.
-- Free loopback ports `3001` and `3002`. Both can be changed in `.env`.
-- Outbound TCP 587 to `smtp-relay.brevo.com`. Inbound port 25 is **not** needed.
+Docker Engine with the Compose v2 plugin; about 4 GiB free RAM; outbound TCP
+443 and 587; Cloudflare-managed DNS for your domains; a Brevo account.
+**No inbound ports**, not even 25.
 
-Read [docs/architecture.md](docs/architecture.md) for why it's built this way.
+## Licence and upstreams
+
+This repository is glue: Compose files, scripts, a Worker and documentation.
+Chatwoot (MIT, plus enterprise features under their own licence) and Listmonk
+(AGPL-3.0) are used unmodified, from their official images. Respect their
+licences when you redistribute or modify them.

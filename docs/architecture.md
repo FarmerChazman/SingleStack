@@ -1,103 +1,125 @@
 # Architecture and decisions
 
-## Constraints that shaped this stack
+## Design constraints
 
-- **It shares a host with about 20 containers.** `farmanalyser-nginx` already
-  holds `:80`, and `5173`, `8000`, `8088`, `8090` and `9000–9001` are taken.
-- **Inbound port 25 is closed**, so the host can't receive SMTP directly.
-- **TLS already ends at Cloudflare.** A dashboard-managed tunnel
-  (`vmwebt1650`) runs cloudflared on the host and reaches services on
-  `localhost`. Nothing publishes `:443`.
-- **Volume is about 5,000 emails a month**, across several brands.
+singlestack is built for a common small-operator situation:
 
-## Data flow
+- **One shared Docker host** that already runs other projects. Ports 80 and
+  443 often belong to an existing proxy, and many common ports are taken.
+- **Inbound port 25 isn't available.** Residential and many cloud networks
+  block it, and running a public MTA is a job of its own.
+- **Cloudflare already terminates TLS**, typically through Cloudflare Tunnel.
+- **Several brands or domains**, with modest volume: thousands of mails a
+  month, not millions.
 
-**Inbound support mail.** A sender's MTA delivers to Cloudflare's MX. An Email
-Routing rule (`support@brand`, or the `in.` subdomain catch-all) passes the
-message to the `inbound-mail` worker. The worker POSTs the raw MIME to
-`https://support.<domain>/rails/action_mailbox/relay/inbound_emails` with
-`actionmailbox:<CHATWOOT_INBOUND_PASSWORD>`. Chatwoot matches the
-`To`/`Cc`/`X-Original-To` address to an Email inbox, or matches
-`reply+<uuid>@in.<domain>` to an existing conversation.
+## Components
 
-**Outbound support mail.** Chatwoot sends through its global SMTP setting
-(Brevo, port 587, STARTTLS). The From address is the inbox's address, and the
-Reply-To is `reply+<uuid>@in.<domain>`, so customer replies return to the same
-thread.
+| Container | Image | Networks | Published | Role |
+|---|---|---|---|---|
+| `ss-postgres` | `pgvector/pgvector:pg16` | backend | — | one instance; databases `chatwoot` and `listmonk`, each with its own owner role |
+| `ss-redis` | `redis:7-alpine` | backend | — | Chatwoot's Sidekiq queues and ActionCable |
+| `ss-chatwoot-migrate` | `chatwoot/chatwoot` | default, backend | — | one-shot `db:chatwoot_prepare`; gates the two below |
+| `ss-chatwoot` | `chatwoot/chatwoot` | default, backend, edge | `127.0.0.1:3001` | Rails web, API, ActionCable, Action Mailbox ingress |
+| `ss-chatwoot-worker` | `chatwoot/chatwoot` | default, backend | — | Sidekiq: outgoing mail, inbound mail processing, jobs |
+| `ss-listmonk` | `listmonk/listmonk` | default, backend, edge | `127.0.0.1:3002` | campaigns, subscriber pages, admin |
 
-**Campaigns.** Listmonk sends through Brevo with its own SMTP key. Public pages
-(subscribe, unsubscribe, tracking links, archive) are served on `lists.<domain>`.
+Outside the host:
 
-**App mail.** Each app talks to Brevo directly with its own key. It never
-passes through this stack.
+| Piece | Where | Role |
+|---|---|---|
+| Cloudflare Email Routing | each zone | MX for all domains; rules → Worker / forward / drop |
+| `singlestack-inbound-mail` | Cloudflare Workers | raw message → Chatwoot relay ingress, with retries and fallback |
+| Cloudflare Tunnel | `cloudflared` on the host | `support.` → `:3001`, `lists.` → `:3002` |
+| Brevo | SaaS | SMTP relay for all outbound mail; DKIM signing for your domains |
+
+## Networks
+
+- **`backend`** is `internal: true`. Postgres and Redis can't reach the
+  internet, and only stack containers can reach them.
+- **`default`** gives the app containers egress: Brevo SMTP, webhooks,
+  image pulls.
+- **`edge`** is external and shared. It's only needed when a proxy runs *in a
+  container* (chapter 7 §7.3). `make up` creates it, so it costs nothing when
+  unused.
+- **Host binds are loopback only.** Nothing is reachable from the LAN or the
+  public IP.
 
 ## Decisions
 
-### D1: No self-hosted mail server (BillionMail dropped)
-With port 25 closed, a mail server would only be a sending hop in front of
-Brevo, plus mailboxes nobody reads. Cloudflare handles inbound and Brevo
-handles outbound. *What we give up:* mailboxes on our own server, and per-app
-SMTP logins issued locally. Brevo keys replace those logins (see D7).
+### D1: No self-hosted mail server
+Without inbound port 25, a self-hosted MTA could only be a sending hop in
+front of a relay, plus mailboxes nobody reads. Cloudflare receives and Brevo
+sends. Each is free at this scale, has good reputation, and is operated by
+someone else. *Trade-off:* there are no hosted mailboxes. Forward personal
+addresses to an existing mailbox.
 
 ### D2: No bundled reverse proxy or TLS
-The host already has an edge: Cloudflare Tunnel, with cloudflared on the host.
-A second proxy would only fight `farmanalyser-nginx` for `:80`. The stack
-binds to `127.0.0.1:3001` and `:3002`, and two tunnel routes publish them.
-Nothing is reachable from the LAN or the public IP.
-
-The stack also joins an external Docker network, `edge`, for one case: if a
-proxy *container* ever fronts it, that container can't use the host's
-`127.0.0.1`, so it reaches the stack by container name instead. `make up`
-creates the network, so it costs nothing when it isn't used.
+A second proxy would fight the host's existing one for 80 and 443. The stack
+binds loopback ports, and the tunnel publishes them. A shared Docker network
+covers the case where the proxy itself is a container, since a container
+can't reach the host's `127.0.0.1`.
 
 ### D3: One Postgres instance, one database and role per app
-`pgvector/pgvector:pg16` is the image Chatwoot requires, and Listmonk runs on
-it unchanged. Each app owns only its own database, so a bug or a compromised
-app can't read the other's data. Backups and restores stay per database. *Cost:*
-both apps upgrade Postgres majors together, which is rare and planned.
+Chatwoot requires pgvector, and Listmonk runs on it unchanged. Separate
+owner roles mean neither app can read the other's data, and backups and
+restores happen per database. *Cost:* the two apps share Postgres major
+upgrades, which are rare and planned (chapter 9 §9.3).
 
-### D4: Inbound through a worker and Rails' relay ingress, not IMAP polling
-IMAP would need a real mailbox somewhere, credentials stored in Chatwoot, and
-a polling delay. With the relay ingress, delivery is near-instant, there's no
-mailbox to maintain, and the only secret is the shared ingress password. The
-worker retries 5xx and network errors. If Chatwoot is down, it forwards to
-`FALLBACK_FORWARD`, so mail isn't lost during an outage or upgrade.
+### D4: Inbound through an Email Worker and Rails' relay ingress
+The alternatives were IMAP polling (it needs a real mailbox somewhere,
+stored credentials, and adds polling delay) or a third-party inbound parse
+service. The relay ingress accepts raw RFC 822 over HTTPS with one shared
+secret. Delivery takes seconds, and the Worker adds retries and a fallback
+mailbox, so a Chatwoot outage doesn't lose mail.
 
-### D5: Migrations as a one-shot service that gates the app
-`chatwoot-migrate` runs `db:chatwoot_prepare` on every `up`. That loads the
-schema on the first run and migrates afterwards. Web and worker start only
-when it exits 0 (`service_completed_successfully`). A failed migration stops
-the deploy instead of booting half-migrated code. Listmonk does the same thing
+### D5: Conversation continuity via subaddressing
+Chatwoot gives every conversation a `reply+<uuid>@domain` Reply-To address.
+Cloudflare catch-alls exist only on apex domains (and you may want the
+catch-all for something else), and subdomains can't be added through the
+API. One literal `reply@` rule plus zone subaddressing covers every UUID
+exactly, and the script automates it.
+
+### D6: Migrations as a gating one-shot service
+`chatwoot-migrate` must exit 0 before web and worker start
+(`service_completed_successfully`). A failed migration blocks the deploy
+instead of running new code against an old schema. Listmonk does the same
 inside its own command (`--install --idempotent && --upgrade`).
 
-### D6: Pinned images, explicit upgrades
-Tags live in `.env`. An upgrade means changing the tag, reading the release
-notes, and running `make upgrade`, which backs up first. `latest` is never
-used, so a restart never changes the version by surprise.
+### D7: Pinned images, explicit upgrades
+Tags live in `.env`, and `latest` is never used. `make upgrade` always backs
+up first. Rollback means a restore, because migrations are one-way.
 
-### D7: One Brevo SMTP key per consumer
-Chatwoot, Listmonk and each app get separate keys. You can revoke one leaked
-key without touching the rest, and Brevo's logs show who sent what.
+### D8: One Brevo SMTP key per consumer
+Chatwoot, Listmonk and each app get separate keys. One leaked key can be
+revoked without touching the rest, and Brevo's logs attribute every message
+to its key.
 
-### D8: Backups run from host cron, not from a sidecar container
-`make backup` takes `pg_dump -Fc` of each database (a consistent MVCC
-snapshot), tarballs of both file volumes, and the `.env` file. The `.env` copy
-matters: without `SECRET_KEY_BASE`, Chatwoot can't decrypt the credentials it
-stores. A cron line has fewer moving parts than a long-running backup
-container.
+### D9: Host-cron backups, `.env` included
+`pg_dump -Fc` per database is a consistent snapshot without stopping
+anything. File volumes are tarred from the running containers. `.env` is
+included because `SECRET_KEY_BASE` is needed to decrypt Chatwoot's encrypted
+columns. A cron line has fewer moving parts than a backup sidecar.
+Checksums are verified on restore, and only complete backups are kept
+(written as `.partial`, then renamed).
 
-### D9: Hardening defaults
-Postgres and Redis sit on an `internal` network with no route out. Every
-secret is required (`${VAR:?}`). `no-new-privileges` is on, logs are capped
-at 10 MB × 3 per container, each container has a memory limit, and `.env` is
-mode 600.
+### D10: Email Routing as code, additive only
+`cf-email-routing.sh` converges rules from a text file but never deletes
+anything it didn't create. It refuses to enable zones whose MX records
+belong to another provider. Personal configuration stays out of git.
 
-## Not built (yet), on purpose
+### D11: Hardening defaults
+Every secret is required (`${VAR:?}`), and `.env` is mode 600 and parsed
+without being executed. `no-new-privileges`, per-container memory limits and
+capped log files are set throughout. The Worker has no public HTTP route
+(`workers_dev = false`). Cloudflare Access is recommended for the Listmonk
+admin.
 
-- **Listmonk bounce ingestion from Brevo.** Brevo already suppresses hard
-  bounces and complaints on its side. A small webhook adapter (Brevo →
-  `/webhooks/bounce`) can be added to the worker if list hygiene needs it.
-- **Offsite backups.** Pipe `backups/` to restic or rclone-crypt. Which one
-  depends on your storage, so it isn't scripted here.
-- **S3 storage for Chatwoot attachments.** Local disk is fine at this volume.
-  Switch with `ACTIVE_STORAGE_SERVICE` when needed.
+## Deliberately not included
+
+- **Listmonk bounce processing from Brevo webhooks.** Brevo already suppresses
+  hard bounces. An adapter (Brevo webhook → Listmonk `/webhooks/bounce`) would
+  fit in the Worker if list hygiene needs it.
+- **S3 storage for attachments.** Local volumes are fine at this scale.
+  Switch Chatwoot's `ACTIVE_STORAGE_SERVICE` when needed.
+- **High availability.** Single host by design. Recovery is restore-based
+  (chapter 9 §9.2.4).

@@ -3,6 +3,8 @@
 .env.*
 !.env.example
 backups/
+# your real routing config holds personal addresses; only the .example is tracked
+deploy/cloudflare/email-routing.conf
 
 # worker
 workers/inbound-mail/node_modules/

@@ -6,7 +6,7 @@
 . "$(dirname "$0")/lib/common.sh"
 
 domain="${1:-${DOMAIN:-}}"
-[[ -n "$domain" ]] || die "usage: $0 <domain>   e.g. $0 farmanalyser.com.au"
+[[ -n "$domain" ]] || die "usage: $0 <domain>   e.g. $0 example.com"
 [[ "$domain" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "not a domain: $domain"
 [[ -e "$ENV_FILE" ]] && die "$ENV_FILE already exists — edit it, or move it away first"
 require_cmd openssl
