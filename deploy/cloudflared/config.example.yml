@@ -1,0 +1,15 @@
+# Only if cloudflared should reach the stack directly (skipping nginx).
+# Merge these rules into your tunnel's ingress list ABOVE the catch-all rule.
+#
+#  cloudflared in Docker -> attach it to the `edge` network, use the container names below.
+#  cloudflared on host   -> use http://127.0.0.1:3001 and http://127.0.0.1:3002 instead.
+#  Dashboard-managed tunnel (token) -> add the same two "Public Hostnames" in
+#  Zero Trust > Networks > Tunnels > <tunnel> > Public Hostname.
+
+ingress:
+  - hostname: support.example.com
+    service: http://ss-chatwoot:3000
+  - hostname: lists.example.com
+    service: http://ss-listmonk:9000
+  # ...your existing rules...
+  - service: http_status:404

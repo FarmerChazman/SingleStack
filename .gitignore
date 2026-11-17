@@ -1,0 +1,9 @@
+# secrets and runtime data
+.env
+.env.*
+!.env.example
+backups/
+
+# worker
+workers/inbound-mail/node_modules/
+workers/inbound-mail/.wrangler/

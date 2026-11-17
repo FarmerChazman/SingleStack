@@ -1,0 +1,17 @@
+# Deploy:  npm ci && npx wrangler login && npx wrangler deploy
+# Secret:  npx wrangler secret put CHATWOOT_INBOUND_PASSWORD   (same value as .env)
+name = "singlestack-inbound-mail"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+# No public HTTP route: the worker is only invoked by Email Routing.
+workers_dev = false
+
+[vars]
+CHATWOOT_INBOUND_URL = "https://support.example.com/rails/action_mailbox/relay/inbound_emails"
+# A *verified* Email Routing destination that receives mail when Chatwoot is down.
+# Strongly recommended. Leave empty to have failures reported back to the sender.
+FALLBACK_FORWARD = ""
+
+[observability]
+enabled = true

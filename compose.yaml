@@ -1,0 +1,223 @@
+# singlestack — support desk (Chatwoot) + campaigns (Listmonk) for a shared host.
+#
+# Design rules (see docs/architecture.md):
+#   * No public ports. Web UIs bind to host loopback only, and the existing
+#     reverse proxy reaches them over the external `edge` network.
+#   * Data services (postgres, redis) sit on an internal network with no egress.
+#   * Every secret is required (`:?`) so a half-filled .env fails fast.
+#   * Images are pinned in .env; upgrades are explicit (`make upgrade`).
+
+name: ${COMPOSE_PROJECT_NAME:-singlestack}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+
+x-chatwoot: &chatwoot
+  <<: *hardening
+  image: ${CHATWOOT_IMAGE:?set CHATWOOT_IMAGE in .env}
+  restart: unless-stopped
+  logging: *logging
+  environment:
+    RAILS_ENV: production
+    NODE_ENV: production
+    INSTALLATION_ENV: docker
+    TZ: ${TZ:-UTC}
+    SECRET_KEY_BASE: ${CHATWOOT_SECRET_KEY_BASE:?}
+    FRONTEND_URL: https://${SUPPORT_HOST:?}
+    # TLS terminates at Cloudflare / the edge proxy, not in Rails.
+    FORCE_SSL: "false"
+    ENABLE_ACCOUNT_SIGNUP: ${CHATWOOT_ENABLE_SIGNUP:-false}
+    DEFAULT_LOCALE: en
+    RAILS_LOG_TO_STDOUT: "true"
+    LOG_LEVEL: ${CHATWOOT_LOG_LEVEL:-info}
+    ACTIVE_STORAGE_SERVICE: local
+    # Database
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_DATABASE: chatwoot
+    POSTGRES_USERNAME: chatwoot
+    POSTGRES_PASSWORD: ${CHATWOOT_DB_PASSWORD:?}
+    # Queue / cache
+    REDIS_URL: redis://redis:6379
+    REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    # Outbound mail -> Brevo
+    MAILER_SENDER_EMAIL: ${CHATWOOT_MAILER_SENDER:?}
+    SMTP_ADDRESS: ${BREVO_SMTP_HOST:-smtp-relay.brevo.com}
+    SMTP_PORT: ${BREVO_SMTP_PORT:-587}
+    SMTP_DOMAIN: ${DOMAIN:?}
+    SMTP_USERNAME: ${CHATWOOT_SMTP_USER:?}
+    SMTP_PASSWORD: ${CHATWOOT_SMTP_KEY:?}
+    SMTP_AUTHENTICATION: login
+    SMTP_ENABLE_STARTTLS_AUTO: "true"
+    # Inbound mail <- Cloudflare Email Worker (workers/inbound-mail)
+    RAILS_INBOUND_EMAIL_SERVICE: relay
+    RAILS_INBOUND_EMAIL_PASSWORD: ${CHATWOOT_INBOUND_PASSWORD:?}
+    MAILER_INBOUND_EMAIL_DOMAIN: ${CHATWOOT_INBOUND_DOMAIN:?}
+  volumes:
+    - chatwoot_storage:/app/storage
+  networks: [default, backend]
+
+services:
+  # ── data ────────────────────────────────────────────────────────────────
+  postgres:
+    <<: *hardening
+    image: ${POSTGRES_IMAGE:-pgvector/pgvector:pg16}
+    container_name: ss-postgres
+    restart: unless-stopped
+    logging: *logging
+    shm_size: 256mb
+    environment:
+      TZ: ${TZ:-UTC}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?}
+      # Consumed once by services/postgres/initdb on first boot.
+      CHATWOOT_DB_PASSWORD: ${CHATWOOT_DB_PASSWORD:?}
+      LISTMONK_DB_PASSWORD: ${LISTMONK_DB_PASSWORD:?}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./services/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+    deploy:
+      resources:
+        limits: { memory: 1g }
+
+  redis:
+    <<: *hardening
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    container_name: ss-redis
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    command: ["sh", "-c", 'exec redis-server --requirepass "$$REDIS_PASSWORD" --appendonly yes']
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", 'redis-cli -a "$$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+    deploy:
+      resources:
+        limits: { memory: 256m }
+
+  # ── chatwoot ────────────────────────────────────────────────────────────
+  # One-shot: loads schema on first run, runs migrations on every `up`.
+  chatwoot-migrate:
+    <<: *chatwoot
+    container_name: ss-chatwoot-migrate
+    restart: "no"
+    entrypoint: docker/entrypoints/rails.sh
+    command: ["bundle", "exec", "rails", "db:chatwoot_prepare"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  chatwoot-web:
+    <<: *chatwoot
+    container_name: ss-chatwoot
+    entrypoint: docker/entrypoints/rails.sh
+    command: ["bundle", "exec", "rails", "s", "-p", "3000", "-b", "0.0.0.0"]
+    ports:
+      - "${CHATWOOT_BIND:-127.0.0.1:3001}:3000"
+    networks: [default, backend, edge]
+    depends_on:
+      chatwoot-migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health | grep -q woot"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    deploy:
+      resources:
+        limits: { memory: 1536m }
+
+  chatwoot-worker:
+    <<: *chatwoot
+    container_name: ss-chatwoot-worker
+    command: ["bundle", "exec", "sidekiq", "-C", "config/sidekiq.yml"]
+    depends_on:
+      chatwoot-migrate: { condition: service_completed_successfully }
+    deploy:
+      resources:
+        limits: { memory: 1536m }
+
+  # ── listmonk ────────────────────────────────────────────────────────────
+  listmonk:
+    <<: *hardening
+    image: ${LISTMONK_IMAGE:?set LISTMONK_IMAGE in .env}
+    container_name: ss-listmonk
+    restart: unless-stopped
+    logging: *logging
+    # --install is idempotent (no-op on an existing DB); --upgrade applies
+    # migrations after an image bump. --config '' = env-only configuration.
+    command:
+      - sh
+      - -c
+      - >-
+        ./listmonk --install --idempotent --yes --config '' &&
+        ./listmonk --upgrade --yes --config '' &&
+        exec ./listmonk --config ''
+    environment:
+      TZ: ${TZ:-UTC}
+      PUID: "1000"
+      PGID: "1000"
+      LISTMONK_app__address: 0.0.0.0:9000
+      LISTMONK_db__host: postgres
+      LISTMONK_db__port: "5432"
+      LISTMONK_db__user: listmonk
+      LISTMONK_db__password: ${LISTMONK_DB_PASSWORD:?}
+      LISTMONK_db__database: listmonk
+      LISTMONK_db__ssl_mode: disable
+      LISTMONK_db__max_open: "25"
+      LISTMONK_db__max_idle: "25"
+      LISTMONK_db__max_lifetime: 300s
+      # Only used on the very first boot to create the super-admin.
+      LISTMONK_ADMIN_USER: ${LISTMONK_ADMIN_USER:?}
+      LISTMONK_ADMIN_PASSWORD: ${LISTMONK_ADMIN_PASSWORD:?}
+    volumes:
+      - listmonk_uploads:/listmonk/uploads
+    ports:
+      - "${LISTMONK_BIND:-127.0.0.1:3002}:9000"
+    networks: [default, backend, edge]
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9000/health >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { memory: 512m }
+
+networks:
+  default: {}
+  # No egress: postgres/redis can't reach the internet, and only stack members reach them.
+  backend:
+    internal: true
+  # Shared with the host's existing reverse proxy (nginx container or cloudflared).
+  edge:
+    external: true
+    name: ${EDGE_NETWORK:-edge}
+
+volumes:
+  postgres_data:
+  redis_data:
+  chatwoot_storage:
+  listmonk_uploads:

@@ -1,0 +1,4 @@
+# Resolve `. "$(dirname "$0")/lib/common.sh"` relative to each script.
+source-path=SCRIPTDIR
+# `cond && ok … || warn …` is intentional: ok/warn always return 0.
+disable=SC2015

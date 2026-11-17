@@ -1,0 +1,38 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  stack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -x scripts/*.sh scripts/lib/*.sh services/postgres/initdb/*.sh
+      - name: compose renders with a generated .env
+        run: |
+          ENV_FILE=/tmp/ci.env scripts/init-env.sh ci.example.org
+          sed -i 's/^CHATWOOT_SMTP_USER=$/CHATWOOT_SMTP_USER=ci/; s/^CHATWOOT_SMTP_KEY=$/CHATWOOT_SMTP_KEY=ci/' /tmp/ci.env
+          docker compose --env-file /tmp/ci.env config -q
+      - name: compose fails fast on a missing secret
+        run: |
+          sed '/^REDIS_PASSWORD=/d' /tmp/ci.env > /tmp/broken.env
+          ! docker compose --env-file /tmp/broken.env config -q 2>/dev/null
+
+  inbound-mail-worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/inbound-mail
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: workers/inbound-mail/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npx wrangler deploy --dry-run --outdir dist
